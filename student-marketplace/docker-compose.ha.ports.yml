@@ -1,0 +1,20 @@
+# Development-only override: publishes the two PostgreSQL nodes on the host so a GUI client
+# (pgAdmin, DBeaver, DataGrip) can connect to them.
+#
+#   docker compose -f docker-compose.ha.yml -f docker-compose.ha.ports.yml up -d
+#
+# Then add TWO servers in pgAdmin:
+#   localhost:5433  -> pg1 (whichever role it has: primary or standby)
+#   localhost:5434  -> pg2
+# Both show the same databases (marketplace, postgres) because they are the same cluster;
+# the standby's connection is read-only.
+#
+# Bound to 127.0.0.1 only. Never use this file in production: it would expose PostgreSQL
+# to the host network. Production keeps both nodes internal to the Docker network.
+services:
+  pg1:
+    ports:
+      - "127.0.0.1:5433:5432"
+  pg2:
+    ports:
+      - "127.0.0.1:5434:5432"

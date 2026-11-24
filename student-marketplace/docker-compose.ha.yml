@@ -1,0 +1,174 @@
+# High-availability PostgreSQL for the backend.
+#
+#   cp .env.example .env      # fill in DB_PASSWORD, POSTGRES_SUPERUSER_PASSWORD,
+#                             # REPLICATION_PASSWORD, REWIND_PASSWORD
+#   docker compose -f docker-compose.ha.yml up -d --build
+#
+# What runs:
+#   etcd    - keeps the leader key (one node is enough for this stack; see HA.md)
+#   pg1     - Patroni + PostgreSQL 16
+#   pg2     - Patroni + PostgreSQL 16, synchronous streaming replica
+#   app     - Spring Boot, connects to "pg1,pg2" with targetServerType=primary
+#   db-backup - daily pg_dump from the current primary, kept for 14 days
+#
+# If pg1 dies, Patroni promotes pg2 in ~10-30 seconds. Existing JDBC connections fail;
+# HikariCP opens new ones and the multi-host JDBC URL finds the new primary. No manual
+# step and no application restart are needed. Full guide: student-marketplace-main/deploy/HA.md
+name: student-marketplace-ha
+
+x-patroni-environment: &patroni-environment
+  PATRONI_SCOPE: marketplace
+  PATRONI_NAMESPACE: /service/
+  PATRONI_ETCD3_HOSTS: etcd:2379
+  PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+  PATRONI_SUPERUSER_USERNAME: postgres
+  PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+  PATRONI_REPLICATION_USERNAME: replicator
+  PATRONI_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?set REPLICATION_PASSWORD in .env}
+  PATRONI_REWIND_USERNAME: rewind_user
+  PATRONI_REWIND_PASSWORD: ${REWIND_PASSWORD:?set REWIND_PASSWORD in .env}
+  PATRONI_POSTGRESQL_DATA_DIR: /data/postgresql
+  PATRONI_POSTGRESQL_BIN_DIR: /usr/lib/postgresql/16/bin
+  PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+  DB_NAME: ${DB_NAME:-marketplace}
+  DB_USER: ${DB_USER:-marketplace}
+  DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+  TZ: Asia/Almaty
+
+x-patroni-service: &patroni-service
+  build:
+    context: ./deploy/ha
+    dockerfile: patroni.Dockerfile
+  restart: unless-stopped
+  depends_on:
+    etcd:
+      condition: service_healthy
+  networks:
+    - internal
+  security_opt:
+    - no-new-privileges:true
+  healthcheck:
+    # Patroni's /health only says the agent is alive; also require PostgreSQL itself.
+    test: ["CMD-SHELL", "pg_isready -h /tmp -U postgres && curl -fsS http://127.0.0.1:8008/health || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 40s
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.36
+    restart: unless-stopped
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd1=http://etcd:2380
+      - --initial-cluster-state=new
+    volumes:
+      - etcddata:/etcd-data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+
+  pg1:
+    <<: *patroni-service
+    environment:
+      <<: *patroni-environment
+      PATRONI_NAME: pg1
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg1:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg1:5432
+    volumes:
+      - pg1data:/data/postgresql
+
+  pg2:
+    <<: *patroni-service
+    environment:
+      <<: *patroni-environment
+      PATRONI_NAME: pg2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg2:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg2:5432
+    volumes:
+      - pg2data:/data/postgresql
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      # Start immediately and let Flyway/Hikari retry until a leader is ready. Waiting for
+      # both nodes would take the site down when one node (e.g. the standby) is broken.
+      pg1:
+        condition: service_started
+    environment:
+      # Both nodes are listed. targetServerType=primary makes the driver skip the
+      # read-only replica and reconnect to the promoted node after a failover.
+      DB_URL: "jdbc:postgresql://pg1:5432,pg2:5432/${DB_NAME:-marketplace}?targetServerType=primary&hostRecheckSeconds=5&connectTimeout=5&tcpKeepAlive=true"
+      DB_USER: ${DB_USER:-marketplace}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (32+ characters)}
+      JWT_TTL_MINUTES: ${JWT_TTL_MINUTES:-60}
+      AUTH_RATE_LIMIT_PER_MINUTE: ${AUTH_RATE_LIMIT_PER_MINUTE:-20}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ALLOWED_EMAIL_DOMAIN: ${ALLOWED_EMAIL_DOMAIN:-kbtu.kz}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      PHOTO_DIR: /data/photos
+      TZ: Asia/Almaty
+    ports:
+      - "8080:8080"
+    volumes:
+      - photos:/data/photos
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+
+  # Daily pg_dump from whichever node Patroni currently reports as primary (GET /primary),
+  # so the schedule keeps working after a failover without changing configuration.
+  db-backup:
+    build:
+      context: ./deploy/ha
+      dockerfile: patroni.Dockerfile
+    entrypoint: ["/scripts/backup.sh"]
+    # The image runs as postgres (uid 999); root is needed to write the host bind mount.
+    user: "0:0"
+    restart: unless-stopped
+    depends_on:
+      # The script waits for a primary and retries, so it does not need a healthy node to start.
+      pg1:
+        condition: service_started
+    environment:
+      DB_NAME: ${DB_NAME:-marketplace}
+      DB_USER: ${DB_USER:-marketplace}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      PATRONI_HOSTS: pg1 pg2
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      TZ: Asia/Almaty
+    volumes:
+      - ./backups/db:/backups
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  etcddata:
+  pg1data:
+  pg2data:
+  photos:
