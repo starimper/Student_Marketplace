@@ -1,0 +1,68 @@
+# Shared Patroni configuration for both PostgreSQL nodes.
+#
+# Everything that differs per node (name, connect addresses, passwords) is supplied with
+# PATRONI_* environment variables in docker-compose.ha.yml / docker-compose.prod.yml.
+# See https://patroni.readthedocs.io/en/latest/ENVIRONMENT.html
+scope: marketplace
+namespace: /service/
+
+restapi:
+  listen: 0.0.0.0:8008
+
+etcd3:
+  hosts: etcd:2379
+
+bootstrap:
+  # Written to etcd only when the cluster is created for the first time.
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+
+    # Synchronous streaming replication: a commit is acknowledged only after the standby
+    # has received it, so a failover does not lose the last transactions.
+    # strict=false keeps the primary writable if the standby is temporarily down.
+    synchronous_mode: true
+    synchronous_mode_strict: false
+
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        max_connections: 100
+        shared_buffers: 256MB
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 128MB
+        # Required by pg_rewind when data checksums are not enough.
+        wal_log_hints: "on"
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+  pg_hba:
+    - local all all trust
+    - host all all 0.0.0.0/0 scram-sha-256
+    - host replication replicator 0.0.0.0/0 scram-sha-256
+
+  # Creates the application role and database on the node that initialises the cluster.
+  post_bootstrap: /scripts/post-bootstrap.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /data/postgresql
+  bin_dir: /usr/lib/postgresql/16/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    superuser:
+      username: postgres
+    replication:
+      username: replicator
+    rewind:
+      username: rewind_user
+  parameters:
+    unix_socket_directories: /tmp
